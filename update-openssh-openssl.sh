@@ -185,6 +185,8 @@ modify_ssh_config() {
     sed -i '/^GSSAPIStrictAcceptorCheck/s/^/# /' /etc/ssh/sshd_config
     sed -i '/^GSSAPIKeyExchange/s/^/# /' /etc/ssh/sshd_config
     sed -i '/^GSSAPIStoreCredentialsOnRekey/s/^/# /' /etc/ssh/sshd_config
+    sed -i '/^[[:space:]]*[^#[:space:]]*RhostsRSAAuthentication[[:space:]]/s/^[[:space:]]*/&#/' /etc/ssh/sshd_config
+    sed -i '/^[[:space:]]*[^#[:space:]]*RSAAuthentication[[:space:]]/s/^[[:space:]]*/&#/' /etc/ssh/sshd_config
     
     # 添加必要的配置（确保SSH可以正常工作）
     if ! grep -q "^UseDNS" /etc/ssh/sshd_config; then
