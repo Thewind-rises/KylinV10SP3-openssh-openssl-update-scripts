@@ -108,7 +108,7 @@ build_openssh() {
     log_info "编译 OpenSSH ${OPENSSH_VER}..."
     
     id sshd &>/dev/null || useradd -r -s /sbin/nologin -d /var/empty/sshd sshd
-    mkdir -p /var/empty/sshd && chown sshd:sshd /var/empty/sshd
+    mkdir -p /var/empty/sshd && chown root:root /var/empty/sshd && chmod 755 /var/empty/sshd
     
     rm -rf "openssh-${OPENSSH_VER}"
     tar -xzf "openssh-${OPENSSH_VER}.tar.gz"
