@@ -10,3 +10,24 @@
 执行sh update-openssh-openssl.sh
 
 冲个豆浆啃个包子等着结束就行。
+
+【回滚方案】（SOP）
+若升级后 SSH 无法连接或系统异常，通过 IPMI/Console 登录控制台执行：
+
+# 1. 停止当前损坏的 sshd
+systemctl stop sshd
+
+# 2. 还原二进制文件（脚本执行成功前会保留 .bak）
+cd /usr/sbin && [[ -f sshd.bak ]] && mv -f sshd.bak sshd
+cd /usr/bin && for b in ssh scp sftp; do [[ -f ${b}.bak ]] && mv -f ${b}.bak $b; done
+
+# 3. 还原配置文件
+cp -f /opt/openssh-update/backup_*/sshd_config.bak /etc/ssh/sshd_config
+
+# 4. 清理局部 ldconfig（移除新 OpenSSL 的全局搜索路径）
+rm -f /etc/ld.so.conf.d/custom-openssl.conf
+ldconfig
+
+# 5. 重启服务并验证
+systemctl start sshd
+ss -tlnp | grep 22
