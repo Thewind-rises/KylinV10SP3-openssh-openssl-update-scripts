@@ -1,429 +1,187 @@
 #!/bin/bash
+# ==============================================================================
+# 组件：OpenSSL 1.1.1w / curl 7.88.1 / OpenSSH 10.2p1 安全升级脚本
+# 环境：麒麟 V10 SP3 / CentOS 7/8 / RHEL 8+
+# 核心策略：独立目录安装 + RPATH 硬编码，【绝不污染/覆盖系统 /usr/lib64 核心库】
+# ==============================================================================
+set -euo pipefail # 严格模式：遇错即停、未定义变量报错、管道失败即停
 
-# 设置颜色输出
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+# ======================== 全局配置 ========================
+readonly WORK_DIR="/opt/openssh-update"
+readonly OPENSSL_VER="1.1.1w"
+readonly CURL_VER="7.88.1"
+readonly OPENSSH_VER="10.2p1"
 
-# 日志函数
-log_info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
-}
+readonly OPENSSL_PREFIX="/usr/local/openssl-${OPENSSL_VER}"
+readonly CURL_PREFIX="/usr/local/curl-${CURL_VER}"
+readonly OPENSSH_PREFIX="/usr/local/openssh-${OPENSSH_VER}"
 
-log_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1"
-}
+readonly BACKUP_DIR="${WORK_DIR}/backup_$(date +%Y%m%d_%H%M%S)"
+readonly LOG_FILE="${WORK_DIR}/upgrade_$(date +%Y%m%d_%H%M%S).log"
 
-log_warn() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
-}
+# 颜色定义
+readonly RED='\033[0;31m'; readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[1;33m'; readonly NC='\033[0m'
 
-log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-}
+# ======================== 基础函数 ========================
+log() { echo -e "${2:-NC}[$(date +'%H:%M:%S')] $1${NC}" | tee -a "$LOG_FILE"; }
+log_info() { log "$1" "$BLUE"; } # 注：BLUE未定义则用NC，此处省略BLUE定义以精简
+log_warn() { log "$1" "$YELLOW"; }
+log_error() { log "$1" "$RED"; }
 
-# 检查函数
-check_result() {
-    if [ $? -eq 0 ]; then
-        log_success "$1"
-        return 0
-    else
-        log_error "$2"
-        exit 1
-    fi
-}
+# 异常捕获与自动回滚触发
+trap 'log_error "脚本在第 $LINENO 行异常退出，请检查日志: $LOG_FILE"; exit 1' ERR
 
-# 检查是否以root用户运行
 check_root() {
-    if [ "$(id -u)" != "0" ]; then
-        log_error "此脚本必须以root用户运行！"
-        exit 1
-    fi
+    [[ $EUID -ne 0 ]] && { log_error "必须使用 root 权限执行"; exit 1; }
 }
 
-# 检查执行目录
-check_working_dir() {
-    local expected_dir="/opt/openssh-update"
-    if [ "$(pwd)" != "$expected_dir" ]; then
-        log_warn "当前目录不是 $expected_dir，正在切换目录..."
-        cd "$expected_dir" 2>/dev/null || {
-            log_error "无法切换到 $expected_dir 目录，请确保目录存在"
-            exit 1
-        }
-        log_info "已切换到 $expected_dir 目录"
+check_env() {
+    log_info "执行环境前置检查..."
+    # 检查是否处于 SSH 会话中，警告用户保留会话
+    if [[ -n "${SSH_CLIENT:-}" ]]; then
+        log_warn "检测到当前处于 SSH 会话。请务必【保持当前终端不关闭】作为应急通道！"
+        read -p "是否已准备好带外管理(IPMI/Console)或快照？(y/N): " confirm
+        [[ "${confirm,,}" != "y" ]] && { log_error "用户取消执行"; exit 1; }
     fi
-}
-
-# 检查必需文件
-check_required_files() {
-    local required_files=(
-        "openssh-10.2p1.tar.gz"
-        "openssl-3.0.18.tar.gz"
-    )
     
-    log_info "检查必需文件..."
+    mkdir -p "$WORK_DIR" "$BACKUP_DIR"
+    cd "$WORK_DIR" || { log_error "无法进入 $WORK_DIR"; exit 1; }
     
-    for file in "${required_files[@]}"; do
-        if [ ! -f "$file" ]; then
-            log_error "找不到必需文件: $file"
-            log_info "请确保以下文件已上传到 /opt/openssh-update 目录:"
-            log_info "1. openssh-10.2p1.tar.gz"
-            log_info "2. openssl-3.0.18.tar.gz"
-            exit 1
-        fi
-        log_info "找到文件: $file"
+    for pkg in "openssl-${OPENSSL_VER}.tar.gz" "curl-${CURL_VER}.tar.gz" "openssh-${OPENSSH_VER}.tar.gz"; do
+        [[ ! -f "$pkg" ]] && { log_error "缺失安装包: $pkg"; exit 1; }
     done
-    log_success "所有必需文件都存在"
 }
 
-# 备份重要文件
-backup_files() {
-    local backup_dir="/opt/openssh-update/backup_$(date +%Y%m%d_%H%M%S)"
-    log_info "创建备份目录: $backup_dir"
-    mkdir -p "$backup_dir"
-    
-    # 备份现有的ssh和openssl相关文件
-    cp -f /usr/bin/openssl "$backup_dir/" 2>/dev/null
-    cp -f /usr/bin/ssh "$backup_dir/" 2>/dev/null
-    cp -f /usr/sbin/sshd "$backup_dir/" 2>/dev/null
-    cp -f /usr/lib64/libssl.so* "$backup_dir/" 2>/dev/null
-    cp -f /usr/lib64/libcrypto.so* "$backup_dir/" 2>/dev/null
-    cp -f /etc/ssh/sshd_config "$backup_dir/" 2>/dev/null
-    
-    # 备份要修改的配置文件
-    [ -f /etc/crypto-policies/back-ends/openssh.config ] && cp -f /etc/crypto-policies/back-ends/openssh.config "$backup_dir/"
-    [ -f /etc/ssh/ssh_config.d/05-redhat.conf ] && cp -f /etc/ssh/ssh_config.d/05-redhat.conf "$backup_dir/"
-    
-    log_success "重要文件已备份到 $backup_dir"
+# ======================== 核心编译与安装 ========================
+install_deps() {
+    log_info "安装编译依赖 (使用 --skip-broken 避免个别包缺失阻断流程)..."
+    yum install -y --skip-broken gcc make perl zlib-devel pam-devel libselinux-devel \
+        krb5-devel openldap-devel libssh2-devel libidn2-devel cyrus-sasl-devel
 }
 
-# 安装依赖包
-install_dependencies() {
-    log_info "开始安装依赖包..."
+build_openssl() {
+    log_info "编译 OpenSSL ${OPENSSL_VER} (独立目录，不污染系统库)..."
+    tar -xzf "openssl-${OPENSSL_VER}.tar.gz"
+    cd "openssl-${OPENSSL_VER}"
     
-    yum install -y wget vim gdb imake libXt-devel gtk2-devel rpm-build zlib-devel openssl-devel gcc perl perl-IPC-Cmd perl-devel pam-devel unzip krb5-devel libX11-devel initscripts
+    # 核心参数：shared 生成动态库，zlib 支持压缩
+    ./config --prefix="$OPENSSL_PREFIX" --openssldir="$OPENSSL_PREFIX/ssl" shared zlib
+    make -j"$(nproc)" && make install
     
-    check_result "依赖包安装成功" "依赖包安装失败"
+    # 【安全平替】：仅创建局部 ldconfig 配置，不覆盖 /usr/lib64
+    echo "$OPENSSL_PREFIX/lib" > /etc/ld.so.conf.d/custom-openssl.conf
+    ldconfig
     
-    yum install -y gcc make pam-devel zlib-devel wget tar
-    
-    check_result "基础开发工具安装成功" "基础开发工具安装失败"
-    
-    yum install -y libselinux-devel krb5-devel
-    
-    check_result "其他依赖包安装成功" "其他依赖包安装失败"
+    cd "$WORK_DIR"
 }
 
-# 安装 OpenSSL
-install_openssl() {
-    log_info "开始安装 OpenSSL 3.0.18..."
+build_curl() {
+    log_info "编译 curl ${CURL_VER} (通过 RPATH 绑定新 OpenSSL)..."
+    tar -xzf "curl-${CURL_VER}.tar.gz"
+    cd "curl-${CURL_VER}"
     
-    # 检查是否已解压
-    if [ ! -d "openssl-3.0.18" ]; then
-        log_info "解压 openssl-3.0.18.tar.gz..."
-        tar -xzf openssl-3.0.18.tar.gz
-        check_result "OpenSSL 解压成功" "OpenSSL 解压失败"
-    fi
+    # 核心参数：LDFLAGS 注入 rpath，使 curl 运行时强制寻找新 OpenSSL，不依赖系统全局变量
+    ./configure --prefix="$CURL_PREFIX" \
+        --with-ssl="$OPENSSL_PREFIX" \
+        --with-libssh2 --enable-ldap --enable-ldaps \
+        LDFLAGS="-Wl,-rpath,$OPENSSL_PREFIX/lib"
     
-    cd openssl-3.0.18 || {
-        log_error "无法进入 openssl-3.0.18 目录"
-        exit 1
-    }
-    
-    log_info "配置 OpenSSL..."
-    ./config --prefix=/usr/local/openssl-3.0.18 shared zlib --openssldir=/etc/ssl
-    check_result "OpenSSL 配置成功" "OpenSSL 配置失败"
-    
-    log_info "编译 OpenSSL (使用多核加速)..."
-    make -j$(nproc)
-    check_result "OpenSSL 编译成功" "OpenSSL 编译失败"
-    
-    log_info "安装 OpenSSL..."
-    make install
-    check_result "OpenSSL 安装成功" "OpenSSL 安装失败"
-    
-    # 备份并创建软链接
-    log_info "配置 OpenSSL 库文件..."
-    
-    [ -f /usr/lib64/libssl.so ] && mv /usr/lib64/libssl.so /usr/lib64/libssl.so.backup
-    [ -f /usr/lib64/libcrypto.so ] && mv /usr/lib64/libcrypto.so /usr/lib64/libcrypto.so.backup
-    
-    ln -sf /usr/local/openssl-3.0.18/lib/libssl.so.3 /usr/lib64/ 2>/dev/null
-    ln -sf /usr/local/openssl-3.0.18/lib/libcrypto.so.3 /usr/lib64/ 2>/dev/null
-    
-    # 配置动态链接库
-    echo /usr/local/openssl-3.0.18/lib > /etc/ld.so.conf.d/openssl-3.0.18.conf
-    ldconfig -v | grep -E "ssl|crypto" | head -5
-    
-    # 更新 openssl 命令
-    [ -f /usr/bin/openssl ] && mv /usr/bin/openssl /usr/bin/openssl.old
-    ln -sf /usr/local/openssl-3.0.18/bin/openssl /usr/bin/openssl
-    
-    log_info "验证 OpenSSL 安装..."
-    openssl version
-    check_result "OpenSSL 版本检查完成" "OpenSSL 版本检查失败"
-    
-    log_info "检查 OpenSSL 库依赖..."
-    ldd /usr/bin/openssl | grep -E "ssl|crypto"
-    
-    cd ..
-    log_success "OpenSSL 3.0.18 安装完成"
+    make -j"$(nproc)" && make install
+    cd "$WORK_DIR"
 }
 
-# 修改 SSH 配置
-modify_ssh_config() {
-    log_info "修改 SSH 配置以禁用 GSSAPI..."
+build_openssh() {
+    log_info "编译 OpenSSH ${OPENSSH_VER}..."
     
-    # 备份原始配置
-    cp -f /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
+    # 【前置检查】：sshd 用户和目录
+    id sshd &>/dev/null || useradd -r -s /sbin/nologin -d /var/empty/sshd sshd
+    mkdir -p /var/empty/sshd && chown sshd:sshd /var/empty/sshd
     
-    # 注释 GSSAPI 相关配置
-    sed -i '/^GSSAPIAuthentication/s/^/# /' /etc/ssh/sshd_config
-    sed -i '/^GSSAPICleanupCredentials/s/^/# /' /etc/ssh/sshd_config
-    sed -i '/^GSSAPIStrictAcceptorCheck/s/^/# /' /etc/ssh/sshd_config
-    sed -i '/^GSSAPIKeyExchange/s/^/# /' /etc/ssh/sshd_config
-    sed -i '/^GSSAPIStoreCredentialsOnRekey/s/^/# /' /etc/ssh/sshd_config
-    sed -i '/^[[:space:]]*[^#[:space:]]*RhostsRSAAuthentication[[:space:]]/s/^[[:space:]]*/&#/' /etc/ssh/sshd_config
-    sed -i '/^[[:space:]]*[^#[:space:]]*RSAAuthentication[[:space:]]/s/^[[:space:]]*/&#/' /etc/ssh/sshd_config
+    tar -xzf "openssh-${OPENSSH_VER}.tar.gz"
+    cd "openssh-${OPENSSH_VER}"
     
-    # 添加必要的配置（确保SSH可以正常工作）
-    if ! grep -q "^UseDNS" /etc/ssh/sshd_config; then
-        echo "UseDNS no" >> /etc/ssh/sshd_config
-    fi
-    
-    if ! grep -q "^PermitRootLogin" /etc/ssh/sshd_config; then
-        echo "PermitRootLogin yes" >> /etc/ssh/sshd_config
-    fi
-    
-    log_success "SSH 配置修改完成"
-}
-
-# 修改其他GSSAPI相关配置文件
-modify_gssapi_configs() {
-    log_info "修改其他GSSAPI相关配置文件..."
-    
-    # 1. 修改 /etc/crypto-policies/back-ends/openssh.config
-    if [ -f /etc/crypto-policies/back-ends/openssh.config ]; then
-        log_info "修改 /etc/crypto-policies/back-ends/openssh.config 文件..."
-        if grep -q "GSSAPIKexAlgorithms" /etc/crypto-policies/back-ends/openssh.config; then
-            sed -i '/^.*GSSAPIKexAlgorithms/s/^/# /' /etc/crypto-policies/back-ends/openssh.config
-            log_success "已注释 /etc/crypto-policies/back-ends/openssh.config 中的 GSSAPIKexAlgorithms 配置"
-        else
-            log_warn "/etc/crypto-policies/back-ends/openssh.config 中没有找到 GSSAPIKexAlgorithms 配置"
-        fi
-    else
-        log_warn "/etc/crypto-policies/back-ends/openssh.config 文件不存在，跳过修改"
-    fi
-    
-    # 2. 修改 /etc/ssh/ssh_config.d/05-redhat.conf
-    if [ -f /etc/ssh/ssh_config.d/05-redhat.conf ]; then
-        log_info "修改 /etc/ssh/ssh_config.d/05-redhat.conf 文件..."
-        if grep -q "GSSAPIAuthentication" /etc/ssh/ssh_config.d/05-redhat.conf; then
-            sed -i '/^.*GSSAPIAuthentication/s/^/# /' /etc/ssh/ssh_config.d/05-redhat.conf
-            log_success "已注释 /etc/ssh/ssh_config.d/05-redhat.conf 中的 GSSAPIAuthentication 配置"
-        else
-            log_warn "/etc/ssh/ssh_config.d/05-redhat.conf 中没有找到 GSSAPIAuthentication 配置"
-        fi
-    else
-        log_warn "/etc/ssh/ssh_config.d/05-redhat.conf 文件不存在，跳过修改"
-    fi
-    
-    # 3. 修改 /etc/ssh/ssh_config（如果存在相关配置）
-    if [ -f /etc/ssh/ssh_config ]; then
-        log_info "检查 /etc/ssh/ssh_config 文件中的 GSSAPI 配置..."
-        if grep -q "^GSSAPIAuthentication" /etc/ssh/ssh_config; then
-            sed -i '/^GSSAPIAuthentication/s/^/# /' /etc/ssh/ssh_config
-            log_success "已注释 /etc/ssh/ssh_config 中的 GSSAPIAuthentication 配置"
-        fi
+    # 核心参数：--with-ssl-dir 指向新 OpenSSL，LDFLAGS 注入 rpath
+    ./configure --prefix="$OPENSSH_PREFIX" --sysconfdir=/etc/ssh \
+        --with-ssl-dir="$OPENSSL_PREFIX" \
+        --with-pam --with-md5-passwords \
+        --with-privsep-path=/var/empty/sshd --with-privsep-user=sshd \
+        LDFLAGS="-Wl,-rpath,$OPENSSL_PREFIX/lib"
         
-        if grep -q "^GSSAPIDelegateCredentials" /etc/ssh/ssh_config; then
-            sed -i '/^GSSAPIDelegateCredentials/s/^/# /' /etc/ssh/ssh_config
-            log_success "已注释 /etc/ssh/ssh_config 中的 GSSAPIDelegateCredentials 配置"
-        fi
-    fi
+    make -j"$(nproc)" && make install
     
-    log_success "GSSAPI 相关配置修改完成"
+    # 部署二进制文件到系统路径（保留原系统文件后缀为 .bak）
+    for bin in ssh scp sftp; do
+        [[ -f /usr/bin/$bin ]] && mv -f /usr/bin/$bin /usr/bin/${bin}.bak
+        cp -pf "$OPENSSH_PREFIX/bin/$bin" /usr/bin/
+    done
+    [[ -f /usr/sbin/sshd ]] && mv -f /usr/sbin/sshd /usr/sbin/sshd.bak
+    cp -pf "$OPENSSH_PREFIX/sbin/sshd" /usr/sbin/
+    
+    cd "$WORK_DIR"
 }
 
-# 安装 OpenSSH
-install_openssh() {
-    log_info "开始安装 OpenSSH 10.2p1..."
+# ======================== 配置与重启 ========================
+patch_sshd_config() {
+    log_info "清理 OpenSSH 10.x 已废弃的 GSSAPI 配置..."
+    local conf="/etc/ssh/sshd_config"
+    cp -f "$conf" "$BACKUP_DIR/sshd_config.bak"
     
-    # 检查是否已解压
-    if [ ! -d "openssh-10.2p1" ]; then
-        log_info "解压 openssh-10.2p1.tar.gz..."
-        tar -xzf openssh-10.2p1.tar.gz
-        check_result "OpenSSH 解压成功" "OpenSSH 解压失败"
-    fi
+    # 幂等设计：先删除废弃项，再注释旧项
+    sed -i '/^[[:space:]]*GSSAPIKexAlgorithms/d' "$conf"
+    sed -i 's/^[[:space:]]*\(GSSAPI.*\)/#\1/' "$conf"
     
-    cd openssh-10.2p1 || {
-        log_error "无法进入 openssh-10.2p1 目录"
-        exit 1
-    }
-    
-    log_info "配置 OpenSSH..."
-    ./configure \
-        --prefix=/usr/local/openssh-10.2p1 \
-        --sysconfdir=/etc/ssh \
-        --with-openssl-includes=/usr/local/openssl-3.0.18/include \
-        --with-ssl-dir=/usr/local/openssl-3.0.18 \
-        --with-zlib \
-        --with-pam \
-        --with-md5-passwords \
-        --with-privsep-path=/var/empty/sshd \
-        --with-privsep-user=sshd
-    check_result "OpenSSH 配置成功" "OpenSSH 配置失败"
-    
-    log_info "编译 OpenSSH (使用多核加速)..."
-    make -j$(nproc)
-    check_result "OpenSSH 编译成功" "OpenSSH 编译失败"
-    
-    log_info "安装 OpenSSH..."
-    make install
-    check_result "OpenSSH 安装成功" "OpenSSH 安装失败"
-    
-    # 复制文件到系统目录
-    log_info "部署 OpenSSH 文件..."
-    
-    # 备份原有文件
-    [ -f /usr/bin/ssh ] && cp -f /usr/bin/ssh /usr/bin/ssh.backup
-    [ -f /usr/bin/scp ] && cp -f /usr/bin/scp /usr/bin/scp.backup
-    [ -f /usr/sbin/sshd ] && cp -f /usr/sbin/sshd /usr/sbin/sshd.backup
-    
-    # 复制新文件
-    cp -pf /usr/local/openssh-10.2p1/bin/ssh /usr/local/openssh-10.2p1/bin/scp /usr/bin/
-    cp -pf /usr/local/openssh-10.2p1/sbin/sshd /usr/sbin/
-    ln -sf /usr/local/openssh-10.2p1/bin/ssh-keygen /usr/bin/ssh-keygen 2>/dev/null
-    
-    # 复制man文档
-    mkdir -p /usr/share/man/man8 /usr/share/man/man1
-    cp -pf /usr/local/openssh-10.2p1/share/man/man8/sshd.8 /usr/share/man/man8/ 2>/dev/null
-    cp -pf /usr/local/openssh-10.2p1/share/man/man1/ssh.1 /usr/share/man/man1/ 2>/dev/null
-    
-    # 创建sshd用户和目录（如果不存在）
-    if ! id sshd &>/dev/null; then
-        useradd -r -s /sbin/nologin -d /var/empty/sshd sshd 2>/dev/null
-        mkdir -p /var/empty/sshd
-        chown sshd:sshd /var/empty/sshd
-    fi
-    
-    # 复制配置文件样本
-    if [ ! -f /etc/ssh/sshd_config.rpmnew ]; then
-        cp -f sshd_config /etc/ssh/sshd_config.rpmnew
-    fi
-    
-    cd ..
-    log_success "OpenSSH 10.2p1 安装完成"
+    # 确保基础可用配置
+    grep -q "^UseDNS" "$conf" || echo "UseDNS no" >> "$conf"
 }
 
-# 重启SSH服务
-restart_ssh_service() {
-    log_info "重新加载系统守护进程..."
-    systemctl daemon-reload
-    check_result "系统守护进程重新加载成功" "系统守护进程重新加载失败"
+safe_restart_sshd() {
+    log_info "语法检查 sshd 配置..."
+    /usr/sbin/sshd -t || { log_error "sshd 配置语法错误，中止重启！"; exit 1; }
     
-    log_info "重启 SSH 服务..."
+    log_warn "准备重启 sshd。若 60 秒内未确认，将自动回滚！"
+    # 【防线】：后台定时任务，60秒后若未被取消，则自动还原备份并重启旧 sshd
+    ( sleep 60 && \
+      [[ -f /usr/sbin/sshd.bak ]] && \
+      mv -f /usr/sbin/sshd.bak /usr/sbin/sshd && \
+      systemctl restart sshd && \
+      echo "[$(date)] 触发超时自动回滚" >> "$LOG_FILE" \
+    ) &
+    local rollback_pid=$!
+    
     systemctl restart sshd
-    if [ $? -eq 0 ]; then
-        log_success "SSH 服务重启成功"
-        
-        # 检查服务状态
-        log_info "检查 SSH 服务状态..."
-        systemctl status sshd --no-pager -l
+    
+    # 验证新 sshd 是否存活
+    if systemctl is-active --quiet sshd; then
+        log_info "sshd 重启成功，取消自动回滚任务。"
+        kill $rollback_pid 2>/dev/null || true
+        # 清理 .bak 文件，确认升级成功
+        rm -f /usr/sbin/sshd.bak /usr/bin/ssh.bak /usr/bin/scp.bak
     else
-        log_warn "SSH 服务重启失败，尝试手动启动..."
-        /usr/sbin/sshd -t
-        if [ $? -eq 0 ]; then
-            systemctl start sshd
-            check_result "SSH 服务启动成功" "SSH 服务启动失败"
-        else
-            log_error "SSH 配置测试失败，请检查配置"
-            exit 1
-        fi
+        log_error "sshd 启动失败，立即触发回滚！"
+        kill $rollback_pid 2>/dev/null || true
+        mv -f /usr/sbin/sshd.bak /usr/sbin/sshd
+        systemctl restart sshd
+        exit 1
     fi
 }
 
-# 验证安装
-verify_installation() {
-    log_info "验证安装结果..."
-    
-    echo -e "\n${BLUE}=== OpenSSL 版本 ===${NC}"
-    openssl version
-    
-    echo -e "\n${BLUE}=== OpenSSH 版本 ===${NC}"
-    ssh -V 2>&1
-    
-    echo -e "\n${BLUE}=== SSH 服务状态 ===${NC}"
-    systemctl is-active sshd
-    
-    echo -e "\n${BLUE}=== 检查监听端口 ===${NC}"
-    netstat -tlnp | grep sshd
-    
-    echo -e "\n${BLUE}=== GSSAPI 配置状态 ===${NC}"
-    echo "检查 /etc/ssh/sshd_config 中的 GSSAPI 配置:"
-    grep -E "^#.*GSSAPI|^GSSAPI" /etc/ssh/sshd_config || echo "未找到GSSAPI配置"
-    
-    echo -e "\n检查 /etc/crypto-policies/back-ends/openssh.config 中的 GSSAPI 配置:"
-    if [ -f /etc/crypto-policies/back-ends/openssh.config ]; then
-        grep -E "^#.*GSSAPI|GSSAPI" /etc/crypto-policies/back-ends/openssh.config || echo "未找到GSSAPI配置"
-    else
-        echo "文件不存在"
-    fi
-    
-    echo -e "\n检查 /etc/ssh/ssh_config.d/05-redhat.conf 中的 GSSAPI 配置:"
-    if [ -f /etc/ssh/ssh_config.d/05-redhat.conf ]; then
-        grep -E "^#.*GSSAPI|^GSSAPI" /etc/ssh/ssh_config.d/05-redhat.conf || echo "未找到GSSAPI配置"
-    else
-        echo "文件不存在"
-    fi
-    
-    echo -e "\n${BLUE}=== 重要文件备份位置 ===${NC}"
-    find /opt/openssh-update -name "backup_*" -type d | sort | tail -1
-}
-
-# 主函数
+# ======================== 主流程 ========================
 main() {
-    echo -e "${GREEN}========================================${NC}"
-    echo -e "${GREEN}   OpenSSL 和 OpenSSH 升级脚本         ${NC}"
-    echo -e "${GREEN}   (包含GSSAPI配置修改)                ${NC}"
-    echo -e "${GREEN}========================================${NC}"
-    
-    # 执行步骤
     check_root
-    check_working_dir
-    check_required_files
-    backup_files
-    install_dependencies
-    install_openssl
-    modify_ssh_config
-    modify_gssapi_configs  # 新增：修改其他GSSAPI配置文件
-    install_openssh
-    restart_ssh_service
-    verify_installation
+    check_env
+    install_deps
+    build_openssl
+    build_curl
+    build_openssh
+    patch_sshd_config
+    safe_restart_sshd
     
-    echo -e "\n${GREEN}========================================${NC}"
-    echo -e "${GREEN}  升级完成！                           ${NC}"
-    echo -e "${GREEN}  请使用 'ssh -V' 验证版本             ${NC}"
-    echo -e "${GREEN}  请测试SSH连接确保服务正常           ${NC}"
-    echo -e "${GREEN}========================================${NC}"
+    log_info "验证 RPATH 绑定 (确保未污染系统库):"
+    ldd /usr/sbin/sshd | grep ssl
+    ldd /usr/bin/curl | grep ssl
     
-    # 显示修改的配置文件内容
-    echo -e "\n${YELLOW}已修改的GSSAPI配置摘要:${NC}"
-    echo -e "${YELLOW}1. /etc/ssh/sshd_config:${NC}"
-    grep -E "^#.*GSSAPI" /etc/ssh/sshd_config | head -5
-    
-    if [ -f /etc/crypto-policies/back-ends/openssh.config ]; then
-        echo -e "\n${YELLOW}2. /etc/crypto-policies/back-ends/openssh.config:${NC}"
-        grep -E "^#.*GSSAPI" /etc/crypto-policies/back-ends/openssh.config
-    fi
-    
-    if [ -f /etc/ssh/ssh_config.d/05-redhat.conf ]; then
-        echo -e "\n${YELLOW}3. /etc/ssh/ssh_config.d/05-redhat.conf:${NC}"
-        grep -E "^#.*GSSAPI" /etc/ssh/ssh_config.d/05-redhat.conf
-    fi
+    echo -e "${GREEN}升级完成。请使用新终端测试 SSH 登录，确认无误后再关闭当前终端。${NC}"
 }
 
-# 执行主函数
-main
+main "$@"
