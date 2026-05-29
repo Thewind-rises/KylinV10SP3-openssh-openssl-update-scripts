@@ -70,13 +70,14 @@ if [ "$ROLLBACK" = true ]; then
     exit 0
 fi
 
-# ================= 5. 环境准备 =================
+# ================= 5. 环境准备与依赖预检 =================
 echo "=========================================="
-echo "[1/6] 安装编译依赖..."
+echo "[1/6] 检查并安装编译依赖..."
 echo "=========================================="
 mkdir -p "${WORK_DIR}"
 cd "${WORK_DIR}"
 
+# 校验离线包完整性（此步骤不依赖网络，保留）
 for pkg in "$OPENSSL_PKG" "$CURL_PKG" "$OPENSSH_PKG"; do
     if [ ! -f "${WORK_DIR}/${pkg}" ]; then
         echo "❌ 致命错误: 缺失离线包 ${pkg}，请上传至 ${WORK_DIR}！"
@@ -84,8 +85,64 @@ for pkg in "$OPENSSL_PKG" "$CURL_PKG" "$OPENSSH_PKG"; do
     fi
 done
 
-yum groupinstall -y "Development Tools" > /dev/null 2>&1 || true
-yum install -y gcc gcc-c++ make perl zlib-devel pam-devel binutils > /dev/null 2>&1 || true
+# 【优化】定义所需依赖及其对应的验证命令/文件
+# 格式: "rpm包名:验证方式" (验证方式可以是命令或关键文件路径)
+declare -A DEPS_CHECK=(
+    ["gcc"]="gcc --version"
+    ["gcc-c++"]="g++ --version"
+    ["make"]="make --version"
+    ["perl"]="perl -v"
+    ["zlib-devel"]="/usr/include/zlib.h"
+    ["pam-devel"]="/usr/include/security/pam_appl.h"
+    ["binutils"]="readelf --version"
+)
+
+MISSING_DEPS=()
+
+echo "🔍 正在预检编译依赖..."
+for dep in "${!DEPS_CHECK[@]}"; do
+    check_cmd="${DEPS_CHECK[$dep]}"
+    # 判断验证方式是命令还是文件路径
+    if [[ "$check_cmd" == /* ]]; then
+        # 文件路径检查
+        if [ ! -f "$check_cmd" ]; then
+            MISSING_DEPS+=("$dep")
+            echo "   ❌ 缺失: $dep (未找到 $check_cmd)"
+        else
+            echo "   ✅ 已存在: $dep"
+        fi
+    else
+        # 命令检查 (抑制输出，仅获取退出码)
+        if ! eval "$check_cmd" > /dev/null 2>&1; then
+            MISSING_DEPS+=("$dep")
+            echo "   ❌ 缺失: $dep"
+        else
+            echo "   ✅ 已存在: $dep"
+        fi
+    fi
+done
+
+# 仅在存在缺失依赖时才触发 yum
+if [ ${#MISSING_DEPS[@]} -gt 0 ]; then
+    echo "⚠️ 发现 ${#MISSING_DEPS[@]} 个缺失依赖，正在安装: ${MISSING_DEPS[*]}"
+    
+    # 安全检查：确认 yum 可用且未被锁定
+    if ! command -v yum &> /dev/null; then
+        echo "❌ 致命错误: 当前系统无 yum 命令，请手动安装以下依赖后重试: ${MISSING_DEPS[*]}"
+        exit 1
+    fi
+    
+    # 尝试安装，失败时给出明确提示而非直接中断
+    if ! yum install -y "${MISSING_DEPS[@]}" > /dev/null 2>&1; then
+        echo "❌ 依赖安装失败！可能原因: yum源不可用/RPM锁冲突/权限不足"
+        echo "💡 请手动执行: yum install -y ${MISSING_DEPS[*]}"
+        echo "   或在离线环境中使用 rpm -ivh 手动安装对应包后重新运行本脚本"
+        exit 1
+    fi
+    echo "✅ 缺失依赖安装完成。"
+else
+    echo "✅ 所有编译依赖均已满足，跳过 yum 安装。"
+fi
 
 # ================= 6. 编译 OpenSSL (物理隔离) =================
 echo "=========================================="
