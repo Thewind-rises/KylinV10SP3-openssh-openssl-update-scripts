@@ -1,209 +1,238 @@
 #!/bin/bash
-# ==============================================================================
-# 组件：OpenSSL 1.1.1w / curl 7.88.1 / OpenSSH 10.2p1 安全升级脚本 (V3.0 终极修复版)
-# 核心策略：独立目录安装 + RPATH 硬编码，【绝不污染/覆盖系统 /usr/lib64 核心库】
-# ==============================================================================
-set -euo pipefail
+#================================================================
+# 脚本名称: openssh_upgrade.sh
+# 核心原理: RPATH 物理隔离，绝不污染系统全局 /usr/lib64
+# 执行目录: /opt/openssh-update (需提前人工上传离线包)
+#================================================================
 
-# ======================== 全局配置 ========================
-readonly WORK_DIR="/opt/openssh-update"
-readonly OPENSSL_VER="1.1.1w"
-readonly CURL_VER="7.88.1"
-readonly OPENSSH_VER="10.2p1"
+set -euo pipefail 
 
-readonly OPENSSL_PREFIX="/usr/local/openssl-${OPENSSL_VER}"
-readonly CURL_PREFIX="/usr/local/curl-${CURL_VER}"
-readonly OPENSSH_PREFIX="/usr/local/openssh-${OPENSSH_VER}"
+trap 'echo "❌ [ERROR] 脚本在第 $LINENO 行执行失败，触发异常捕获！"; exit 1' ERR
 
-mkdir -p "$WORK_DIR"
-readonly BACKUP_DIR="${WORK_DIR}/backup_$(date +%Y%m%d_%H%M%S)"
-readonly LOG_FILE="${WORK_DIR}/upgrade_$(date +%Y%m%d_%H%M%S).log"
-mkdir -p "$BACKUP_DIR"
-touch "$LOG_FILE"
+# ================= 1. 变量定义 =================
+OPENSSL_VER="1.1.1w"
+CURL_VER="7.88.1"
+OPENSSH_VER="10.2p1"
 
-# 颜色定义
-readonly RED='\033[0;31m'; readonly GREEN='\033[0;32m'
-readonly YELLOW='\033[1;33m'; readonly BLUE='\033[0;34m'; readonly NC='\033[0m'
+OPENSSL_DIR="/usr/local/openssl-${OPENSSL_VER}" 
+CURL_DIR="/usr/local/curl-${CURL_VER}"          
+WORK_DIR="/opt/openssh-update"                  
 
-# ======================== 基础函数 ========================
-log() { 
-    echo -e "${2:-$NC}[$(date +'%H:%M:%S')] $1${NC}" | tee -a "$LOG_FILE" 
-}
-log_info() { log "$1" "$BLUE"; }
-log_warn() { log "$1" "$YELLOW"; }
-log_error() { log "$1" "$RED"; }
+OPENSSL_PKG="openssl-${OPENSSL_VER}.tar.gz"
+CURL_PKG="curl-${CURL_VER}.tar.gz"
+OPENSSH_PKG="openssh-${OPENSSH_VER}.tar.gz"
 
-# 异常捕获
-trap 'log_error "脚本在第 $LINENO 行异常退出，错误代码: $?。请检查日志: $LOG_FILE"; exit 1' ERR
+DATE_TAG=$(date +%Y%m%d)
 
-check_root() {
-    # 【修复】：使用 if 替代 &&，防止 root 执行时返回 1 触发 set -e 退出
-    if [[ $EUID -ne 0 ]]; then
-        log_error "必须使用 root 权限执行"
-        exit 1
-    fi
-}
+# ================= 2. 入参校验与模式分发 =================
+DRY_RUN=false
+ROLLBACK=false
 
-check_env() {
-    log_info "执行环境前置检查..."
-    if [[ -n "${SSH_CLIENT:-}" ]]; then
-        log_warn "检测到当前处于 SSH 会话。请务必【保持当前终端不关闭】作为应急通道！"
-        read -p "是否已准备好带外管理(IPMI/Console)或快照？(y/N): " confirm
-        if [[ "${confirm,,}" != "y" ]]; then
-            log_error "用户取消执行"
-            exit 1
-        fi
-    fi
-    
-    cd "$WORK_DIR" || { log_error "无法进入 $WORK_DIR"; exit 1; }
-    
-    for pkg in "openssl-${OPENSSL_VER}.tar.gz" "curl-${CURL_VER}.tar.gz" "openssh-${OPENSSH_VER}.tar.gz"; do
-        if [[ ! -f "$pkg" ]]; then
-            log_error "缺失安装包: $pkg"
-            exit 1
-        fi
+for arg in "$@"; do
+    case $arg in
+        --dry-run) DRY_RUN=true ;;
+        --rollback) ROLLBACK=true ;;
+        *) echo "未知参数: $arg"; exit 1 ;;
+    esac
+done
+
+# ================= 3. 权限与只读诊断 =================
+if [ "$EUID" -ne 0 ]; then
+  echo "❌ 错误: 需要 root 权限！"
+  exit 1
+fi
+
+if [ "$DRY_RUN" = true ]; then
+    echo "🔍 [Dry-Run] 仅执行环境与介质检查..."
+    [ -d "$WORK_DIR" ] || { echo "❌ 目录不存在"; exit 1; }
+    for pkg in "$OPENSSL_PKG" "$CURL_PKG" "$OPENSSH_PKG"; do
+        [ -f "${WORK_DIR}/${pkg}" ] || { echo "❌ 缺失: ${pkg}"; exit 1; }
+        echo "   ✅ 找到 ${pkg}"
     done
-}
+    systemctl is-active sshd && echo "   ✅ sshd 运行中"
+    echo "✅ [Dry-Run] 检查通过。"
+    exit 0
+fi
 
-# ======================== 核心编译与安装 ========================
-install_deps() {
-    log_info "安装编译依赖..."
-    yum install -y --skip-broken gcc make perl zlib-devel pam-devel libselinux-devel \
-        krb5-devel openldap-devel libssh2-devel libidn2-devel cyrus-sasl-devel
-}
-
-build_openssl() {
-    log_info "编译 OpenSSL ${OPENSSL_VER} (独立目录)..."
-    rm -rf "openssl-${OPENSSL_VER}"
-    tar -xzf "openssl-${OPENSSL_VER}.tar.gz"
-    cd "openssl-${OPENSSL_VER}"
-    
-    ./config --prefix="$OPENSSL_PREFIX" --openssldir="$OPENSSL_PREFIX/ssl" shared zlib
-    make -j"$(nproc)" && make install
-    
-    # 仅创建局部 ldconfig 配置，不覆盖 /usr/lib64
-    echo "$OPENSSL_PREFIX/lib" > /etc/ld.so.conf.d/custom-openssl.conf
-    ldconfig
-    
-    cd "$WORK_DIR"
-}
-
-build_curl() {
-    log_info "编译 curl ${CURL_VER}..."
-    rm -rf "curl-${CURL_VER}"
-    tar -xzf "curl-${CURL_VER}.tar.gz"
-    cd "curl-${CURL_VER}"
-    
-    # LDFLAGS 注入 rpath，使 curl 运行时强制寻找新 OpenSSL
-    ./configure --prefix="$CURL_PREFIX" \
-        --with-ssl="$OPENSSL_PREFIX" \
-        --with-libssh2 --enable-ldap --enable-ldaps \
-        LDFLAGS="-Wl,-rpath,$OPENSSL_PREFIX/lib"
-    
-    make -j"$(nproc)" && make install
-    cd "$WORK_DIR"
-}
-
-build_openssh() {
-    log_info "编译 OpenSSH ${OPENSSH_VER}..."
-    
-    id sshd &>/dev/null || useradd -r -s /sbin/nologin -d /var/empty/sshd sshd
-    mkdir -p /var/empty/sshd && chown root:root /var/empty/sshd && chmod 755 /var/empty/sshd
-    
-    rm -rf "openssh-${OPENSSH_VER}"
-    tar -xzf "openssh-${OPENSSH_VER}.tar.gz"
-    cd "openssh-${OPENSSH_VER}"
-    
-    # --with-ssl-dir 指向新 OpenSSL，LDFLAGS 注入 rpath
-    ./configure --prefix="$OPENSSH_PREFIX" --sysconfdir=/etc/ssh \
-        --with-ssl-dir="$OPENSSL_PREFIX" \
-        --with-pam --with-md5-passwords \
-        --with-privsep-path=/var/empty/sshd --with-privsep-user=sshd \
-        LDFLAGS="-Wl,-rpath,$OPENSSL_PREFIX/lib"
-        
-    make -j"$(nproc)" && make install
-    
-    # 备份并替换二进制文件
-    for bin in ssh scp sftp; do
-        if [[ -f /usr/bin/$bin ]]; then
-            cp -f /usr/bin/$bin "$BACKUP_DIR/${bin}.bak"
-        fi
-        cp -pf "$OPENSSH_PREFIX/bin/$bin" /usr/bin/
-    done
-    
-    if [[ -f /usr/sbin/sshd ]]; then
-        cp -f /usr/sbin/sshd "$BACKUP_DIR/sshd.bak"
+# ================= 4. 回滚逻辑 =================
+if [ "$ROLLBACK" = true ]; then
+    echo "⚠️ [高危操作] 正在执行回滚逻辑..."
+    if ls /usr/sbin/sshd.bak.${DATE_TAG} 1> /dev/null 2>&1; then
+        cp -f /usr/sbin/sshd.bak.${DATE_TAG} /usr/sbin/sshd
+        echo "✅ sshd 已回滚"
     fi
-    cp -pf "$OPENSSH_PREFIX/sbin/sshd" /usr/sbin/
-    
-    cd "$WORK_DIR"
-}
-
-# ======================== 配置与重启 ========================
-patch_sshd_config() {
-    log_info "清理 OpenSSH 10.x 已废弃的 GSSAPI 配置..."
-    local conf="/etc/ssh/sshd_config"
-    cp -f "$conf" "$BACKUP_DIR/sshd_config.bak"
-    
-    # 幂等清理废弃项
-    sed -i '/^[[:space:]]*GSSAPIKexAlgorithms/d' "$conf"
-    sed -i 's/^[[:space:]]*\(GSSAPI.*\)/#\1/' "$conf"
-    
-    if ! grep -q "^UseDNS" "$conf"; then
-        echo "UseDNS no" >> "$conf"
+    if [ -f /usr/bin/curl.sys.bak ]; then
+        mv -f /usr/bin/curl.sys.bak /usr/bin/curl
+        hash -r
+        echo "✅ curl 已回滚"
     fi
-}
-
-safe_restart_sshd() {
-    log_info "语法检查 sshd 配置..."
-    if ! /usr/sbin/sshd -t; then
-        log_error "sshd 配置语法错误，中止重启！"
-        exit 1
-    fi
-    
-    log_warn "准备重启 sshd。若 60 秒内未确认，将自动回滚！"
-    # 【防线】：后台定时任务，60秒后若未被取消，自动还原备份并重启旧 sshd
-    ( sleep 60 && \
-      if [[ -f "$BACKUP_DIR/sshd.bak" ]]; then \
-          cp -f "$BACKUP_DIR/sshd.bak" /usr/sbin/sshd && \
-          systemctl restart sshd && \
-          echo "[$(date)] 触发超时自动回滚" >> "$LOG_FILE"; \
-      fi \
-    ) &
-    local rollback_pid=$!
-    
     systemctl restart sshd
-    
-    if systemctl is-active --quiet sshd; then
-        log_info "sshd 重启成功，取消自动回滚任务。"
-        kill $rollback_pid 2>/dev/null || true
-    else
-        log_error "sshd 启动失败，立即触发回滚！"
-        kill $rollback_pid 2>/dev/null || true
-        if [[ -f "$BACKUP_DIR/sshd.bak" ]]; then
-            cp -f "$BACKUP_DIR/sshd.bak" /usr/sbin/sshd
-            systemctl restart sshd
-        fi
+    exit 0
+fi
+
+# ================= 5. 环境准备 =================
+echo "=========================================="
+echo "[1/6] 安装编译依赖..."
+echo "=========================================="
+mkdir -p "${WORK_DIR}"
+cd "${WORK_DIR}"
+
+for pkg in "$OPENSSL_PKG" "$CURL_PKG" "$OPENSSH_PKG"; do
+    if [ ! -f "${WORK_DIR}/${pkg}" ]; then
+        echo "❌ 致命错误: 缺失离线包 ${pkg}，请上传至 ${WORK_DIR}！"
         exit 1
     fi
-}
+done
 
-# ======================== 主流程 ========================
-main() {
-    check_root
-    check_env
-    install_deps
-    build_openssl
-    build_curl
-    build_openssh
-    patch_sshd_config
-    safe_restart_sshd
-    
-    log_info "验证 RPATH 绑定 (确保未污染系统库):"
-    ldd /usr/sbin/sshd | grep ssl || true
-    ldd /usr/bin/curl | grep ssl || true
-    
-    log_info "升级完成。请使用新终端测试 SSH 登录，确认无误后再关闭当前终端。" "$GREEN"
-}
+yum groupinstall -y "Development Tools" > /dev/null 2>&1 || true
+yum install -y gcc gcc-c++ make perl zlib-devel pam-devel binutils > /dev/null 2>&1 || true
 
-main "$@"
+# ================= 6. 编译 OpenSSL (物理隔离) =================
+echo "=========================================="
+echo "[2/6] 编译并安装 OpenSSL ${OPENSSL_VER}"
+echo "=========================================="
+
+NEED_COMPILE_OPENSSL=true
+if [ -x "${OPENSSL_DIR}/bin/openssl" ]; then
+    if readelf -d "${OPENSSL_DIR}/bin/openssl" 2>/dev/null | grep -qE "RPATH|RUNPATH"; then
+        echo "✅ OpenSSL 已存在且 RPATH 正常，跳过编译。"
+        NEED_COMPILE_OPENSSL=false
+    else
+        echo "⚠️ 发现已存在的 OpenSSL 缺失 RPATH，将清理并重新编译..."
+        rm -rf "${OPENSSL_DIR}"
+    fi
+fi
+
+if [ "$NEED_COMPILE_OPENSSL" = true ]; then
+    rm -rf "${WORK_DIR}/openssl-${OPENSSL_VER}"
+    tar -xzf "${OPENSSL_PKG}"
+    cd "openssl-${OPENSSL_VER}"
+    ./config shared --prefix=${OPENSSL_DIR} --openssldir=${OPENSSL_DIR} -Wl,-rpath,${OPENSSL_DIR}/lib
+    make -j$(nproc)
+    make install
+    cd "${WORK_DIR}"
+fi
+
+if ! readelf -d ${OPENSSL_DIR}/bin/openssl | grep -qE "RPATH|RUNPATH"; then
+    echo "❌ OpenSSL RPATH 注入失败！"
+    exit 1
+fi
+
+# ================= 7. 编译 cURL (绑定新 OpenSSL) =================
+echo "=========================================="
+echo "[3/6] 编译并安装 cURL ${CURL_VER}"
+echo "=========================================="
+
+NEED_COMPILE_CURL=true
+if [ -x "${CURL_DIR}/bin/curl" ]; then
+    if readelf -d "${CURL_DIR}/bin/curl" 2>/dev/null | grep -qE "RPATH|RUNPATH"; then
+        echo "✅ cURL 已存在且 RPATH 正常，跳过编译。"
+        NEED_COMPILE_CURL=false
+    else
+        echo "⚠️ 发现已存在的 cURL 缺失 RPATH，将清理并重新编译..."
+        rm -rf "${CURL_DIR}"
+    fi
+fi
+
+if [ "$NEED_COMPILE_CURL" = true ]; then
+    rm -rf "${WORK_DIR}/curl-${CURL_VER}"
+    tar -xzf "${CURL_PKG}"
+    cd "curl-${CURL_VER}"
+    ./configure \
+      --prefix=${CURL_DIR} \
+      --with-ssl=${OPENSSL_DIR} \
+      --with-zlib \
+      LDFLAGS="-Wl,-rpath,${OPENSSL_DIR}/lib"
+    make -j$(nproc)
+    make install
+    cd "${WORK_DIR}"
+fi
+
+if [ -f /usr/bin/curl ] && [ ! -f /usr/bin/curl.sys.bak ]; then
+    echo "⚠️ 备份系统原生 curl..."
+    cp -f /usr/bin/curl /usr/bin/curl.sys.bak
+fi
+ln -sf ${CURL_DIR}/bin/curl /usr/bin/curl
+hash -r 
+
+# ================= 8. 编译 OpenSSH (绑定新 OpenSSL) =================
+echo "=========================================="
+echo "[4/6] 编译并安装 OpenSSH ${OPENSSH_VER}"
+echo "=========================================="
+echo "⚠️ 备份系统原生 sshd 和 ssh..."
+[ -f /usr/sbin/sshd ] && cp -f /usr/sbin/sshd /usr/sbin/sshd.bak.${DATE_TAG} || true
+[ -f /usr/bin/ssh ] && cp -f /usr/bin/ssh /usr/bin/ssh.bak.${DATE_TAG} || true
+
+rm -rf "${WORK_DIR}/openssh-${OPENSSH_VER}"
+tar -xzf "${OPENSSH_PKG}"
+cd "openssh-${OPENSSH_VER}"
+make clean || true
+
+export LDFLAGS="-Wl,-rpath,${OPENSSL_DIR}/lib"
+export CPPFLAGS="-I${OPENSSL_DIR}/include"
+
+./configure \
+  --prefix=/usr \
+  --sysconfdir=/etc/ssh \
+  --with-ssl-dir=${OPENSSL_DIR} \
+  --with-zlib \
+  --with-pam \
+  --with-md5-passwords \
+  --mandir=/usr/share/man
+
+make -j$(nproc)
+make install
+cd "${WORK_DIR}"
+
+# ================= 9. 验证与重启 SSH 服务 =================
+echo "=========================================="
+echo "[5/6] 验证 RPATH 隔离与配置合法性"
+echo "=========================================="
+
+# 【修复】同时匹配 libcrypto.so 或 libssl.so，兼容 OpenSSH 10.x 仅链接 libcrypto 的情况
+set +o pipefail
+SSHD_SSL_PATH=$(ldd /usr/sbin/sshd | grep -E 'libcrypto\.so|libssl\.so' | head -n 1 | awk '{print $3}')
+set -o pipefail
+
+if [[ -z "${SSHD_SSL_PATH}" || "${SSHD_SSL_PATH}" != *"openssl-${OPENSSL_VER}"* ]]; then
+    echo "❌ [致命错误] sshd 没有正确绑定到新版 OpenSSL！(当前加载: ${SSHD_SSL_PATH:-未找到})"
+    echo "🔄 触发自动回滚..."
+    if [ -f "/usr/sbin/sshd.bak.${DATE_TAG}" ]; then
+        cp -f "/usr/sbin/sshd.bak.${DATE_TAG}" /usr/sbin/sshd
+        systemctl restart sshd
+        echo "✅ 已回滚至旧版 sshd。"
+    else
+        echo "⚠️ 未找到旧版 sshd 备份，请手动排查！"
+    fi
+    exit 1
+fi
+echo "✅ sshd 已成功绑定至: ${SSHD_SSL_PATH}"
+
+# 验证 sshd_config 语法
+/usr/sbin/sshd -t || { 
+    echo "❌ [致命错误] sshd_config 语法检查失败！触发自动回滚..."; 
+    cp -f /usr/sbin/sshd.bak.${DATE_TAG} /usr/sbin/sshd; 
+    systemctl restart sshd
+    exit 1; 
+}
+echo "✅ sshd_config 语法检查通过。"
+
+echo "=========================================="
+echo "[6/6] 重启 SSH 服务"
+echo "=========================================="
+systemctl enable sshd 2>/dev/null || true
+echo "正在重启 sshd 服务..."
+systemctl restart sshd
+
+# ================= 最终验收 =================
+echo "=========================================="
+echo "🎉 升级全部完成！请核对以下版本信息："
+echo "=========================================="
+echo "1. OpenSSL: $(${OPENSSL_DIR}/bin/openssl version)"
+echo "2. cURL: $(curl --version | head -n 1)"
+echo "3. OpenSSH: $(ssh -V 2>&1)"
+echo "4. sshd SSL 库: $(ldd /usr/sbin/sshd | grep -E 'ssl|crypto')"
+echo "5. yum 健康度: $(yum --version | head -n 1)"
+echo "=========================================="
+echo "⚠️ 警告：在确认能够通过【新终端】成功 SSH 登录之前，绝对禁止关闭当前终端窗口！"
+echo "=========================================="
